@@ -194,6 +194,14 @@ scripts/check-conformance.sh /tmp/huayan
 scripts/test-library.sh /tmp/huayan
 ```
 
+Linux 发布包黑盒场景测试：
+
+```bash
+bash scripts/test-release-linux.sh dist/huayan-v0.4.0/huayan-v0.4.0-linux-amd64
+```
+
+该测试直接使用发布二进制，覆盖 Linux 文件读写、UTF-8 编码、中文数据库查询、事务回滚、命令行参数和运行时错误退出码。
+
 当前基线验证包含 20 个一致性案例和图书馆端到端测试。
 
 核心包覆盖率门禁：
