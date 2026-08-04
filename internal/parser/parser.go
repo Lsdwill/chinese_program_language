@@ -472,7 +472,9 @@ func (p *Parser) queryExpression(start token.Token) ast.Expr {
 				p.advance()
 				query.Descending = true
 			} else {
-				if p.word("升序") { p.advance() }
+				if p.word("升序") {
+					p.advance()
+				}
 			}
 			p.endLine()
 		case p.word("限制"):
@@ -494,7 +496,9 @@ func (p *Parser) word(word string) bool {
 }
 
 func (p *Parser) expectWord(word, message string) token.Token {
-	if p.word(word) { return p.advance() }
+	if p.word(word) {
+		return p.advance()
+	}
 	p.report(p.peek().Span, "E1101", message, "")
 	return token.Token{Kind: token.Identifier, Span: p.peek().Span}
 }
