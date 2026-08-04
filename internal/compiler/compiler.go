@@ -310,6 +310,10 @@ func (c *Compiler) resolveExpr(e ast.Expr, s *scope) {
 			c.resolveExpr(p.Key, s)
 			c.resolveExpr(p.Value, s)
 		}
+	case *ast.Query:
+		c.resolveExpr(x.Database, s)
+		c.resolveExpr(x.WhereValue, s)
+		c.resolveExpr(x.Limit, s)
 	}
 }
 func (c *Compiler) resolveTarget(e ast.Expr, s *scope) {
@@ -761,5 +765,32 @@ func (c *Compiler) compileExpr(ch *bytecode.Chunk, e ast.Expr) {
 			op = bytecode.OpMakeRecord
 		}
 		ch.Emit(op, len(x.Pairs), "", x.Span)
+	case *ast.Query:
+		ch.Emit(bytecode.OpLoadName, ch.AddConstant("选择"), "", x.Span)
+		c.compileExpr(ch, x.Database)
+		ch.Emit(bytecode.OpConstant, ch.AddConstant(x.Table), "", x.Span)
+		if x.WhereField == "" {
+			ch.Emit(bytecode.OpNil, 0, "", x.Span)
+		} else {
+			ch.Emit(bytecode.OpConstant, ch.AddConstant(x.WhereField), "", x.Span)
+			c.compileExpr(ch, x.WhereValue)
+			ch.Emit(bytecode.OpMakeRecord, 1, "", x.Span)
+		}
+		if x.OrderField == "" {
+			ch.Emit(bytecode.OpNil, 0, "", x.Span)
+		} else {
+			ch.Emit(bytecode.OpConstant, ch.AddConstant(x.OrderField), "", x.Span)
+		}
+		if x.Descending {
+			ch.Emit(bytecode.OpTrue, 0, "", x.Span)
+		} else {
+			ch.Emit(bytecode.OpFalse, 0, "", x.Span)
+		}
+		if x.Limit == nil {
+			ch.Emit(bytecode.OpNil, 0, "", x.Span)
+		} else {
+			c.compileExpr(ch, x.Limit)
+		}
+		ch.Emit(bytecode.OpCall, 6, "", x.Span)
 	}
 }

@@ -161,6 +161,12 @@ func TestResolverDiagnosticMatrix(t *testing.T) {
 
 func TestCompilerAllExpressionForms(t *testing.T) {
 	compileTest(t, `
+	让 库 = 空
+	让 查询结果 = 选择 图书 从 库
+	    其中 编号 等于 "B001"
+	    排序 书名 升序
+	    限制 5
+	结束
 让 空值 = 空
 让 真值 = 真
 让 假值 = 假

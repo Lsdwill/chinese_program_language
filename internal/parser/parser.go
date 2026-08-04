@@ -386,6 +386,8 @@ func (p *Parser) expression(min int) ast.Expr {
 func (p *Parser) prefix() ast.Expr {
 	t := p.advance()
 	switch t.Kind {
+	case token.Select:
+		return p.queryExpression(t)
 	case token.Integer:
 		n, e := strconv.ParseInt(t.Literal, 10, 64)
 		if e != nil {
@@ -409,6 +411,9 @@ func (p *Parser) prefix() ast.Expr {
 	case token.Nil:
 		return &ast.Literal{Kind: "nil", Span: t.Span}
 	case token.Identifier:
+		if t.Name() == "选择" && p.check(token.Identifier) {
+			return p.queryExpression(t)
+		}
 		return &ast.Name{Value: t.Name(), Span: t.Span}
 	case token.Not, token.Minus:
 		r := p.expression(8)
@@ -442,6 +447,56 @@ func (p *Parser) prefix() ast.Expr {
 		p.report(t.Span, "E1107", "这里需要表达式", "")
 		return nil
 	}
+}
+
+func (p *Parser) queryExpression(start token.Token) ast.Expr {
+	table := p.expect(token.Identifier, "选择后需要表名")
+	p.expect(token.From, "表名后需要‘从’和数据库变量")
+	database := p.expression(0)
+	query := &ast.Query{Table: table.Name(), Database: database, Span: source.Span{File: start.Span.File, Start: start.Span.Start, End: table.Span.End}}
+	p.endLine()
+	for !p.check(token.End) && !p.check(token.EOF) {
+		switch {
+		case p.word("其中"):
+			p.advance()
+			field := p.expect(token.Identifier, "其中后需要字段名")
+			p.expectWord("等于", "条件字段后需要‘等于’")
+			query.WhereField = field.Name()
+			query.WhereValue = p.expression(0)
+			p.endLine()
+		case p.word("排序"):
+			p.advance()
+			field := p.expect(token.Identifier, "排序后需要字段名")
+			query.OrderField = field.Name()
+			if p.word("降序") {
+				p.advance()
+				query.Descending = true
+			} else {
+				if p.word("升序") { p.advance() }
+			}
+			p.endLine()
+		case p.word("限制"):
+			p.advance()
+			query.Limit = p.expression(0)
+			p.endLine()
+		default:
+			p.report(p.peek().Span, "E1110", "查询块只支持‘其中’、‘排序’和‘限制’", "")
+			p.synchronize()
+		}
+	}
+	end := p.expect(token.End, "查询缺少‘结束’")
+	query.Span.End = end.Span.End
+	return query
+}
+
+func (p *Parser) word(word string) bool {
+	return p.check(token.Identifier) && p.peek().Name() == word
+}
+
+func (p *Parser) expectWord(word, message string) token.Token {
+	if p.word(word) { return p.advance() }
+	p.report(p.peek().Span, "E1101", message, "")
+	return token.Token{Kind: token.Identifier, Span: p.peek().Span}
 }
 func (p *Parser) dictLiteral(start token.Token, record bool) ast.Expr {
 	var pairs []ast.Pair

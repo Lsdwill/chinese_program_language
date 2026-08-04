@@ -270,3 +270,18 @@ type Dict struct {
 func (*Dict) node()                  {}
 func (*Dict) expr()                  {}
 func (e *Dict) GetSpan() source.Span { return e.Span }
+
+type Query struct {
+	Database   Expr
+	Table      string
+	WhereField string
+	WhereValue Expr
+	OrderField string
+	Descending bool
+	Limit      Expr
+	Span       source.Span
+}
+
+func (*Query) node()                  {}
+func (*Query) expr()                  {}
+func (e *Query) GetSpan() source.Span { return e.Span }

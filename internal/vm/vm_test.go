@@ -2,6 +2,8 @@ package vm
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"huayan/internal/bytecode"
@@ -14,6 +16,20 @@ import (
 	"strings"
 	"testing"
 )
+
+type failingDatabaseRunner struct{}
+
+type databaseResultError struct{ last, affected error }
+
+func (r databaseResultError) LastInsertId() (int64, error) { return 0, r.last }
+func (r databaseResultError) RowsAffected() (int64, error) { return 0, r.affected }
+
+func (failingDatabaseRunner) ExecContext(context.Context, string, ...any) (sql.Result, error) {
+	return nil, errors.New("执行失败")
+}
+func (failingDatabaseRunner) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
+	return nil, errors.New("查询失败")
+}
 
 func runVMText(t *testing.T, text string) (string, *RuntimeError) {
 	t.Helper()
@@ -415,6 +431,294 @@ func TestBytesEncodingAndBinaryFiles(t *testing.T) {
 	}
 	if _, re := callNativeForCoverage(t, v, files, "写入字节", Text("数据.bin"), Text("错误类型")); re == nil {
 		t.Fatal("text accepted by binary file API")
+	}
+}
+
+func TestChineseDatabaseAPI(t *testing.T) {
+	v := New(&bytes.Buffer{}, strings.NewReader(""), nil)
+	v.WorkingDir = t.TempDir()
+	database, ok := StandardModule("标准.数据库", v)
+	if !ok {
+		t.Fatal("database module missing")
+	}
+	record := func(items ...struct {
+		name  string
+		value Value
+	}) Value {
+		value := Record()
+		object := value.Data.(*RecordObject)
+		for _, item := range items {
+			object.Order = append(object.Order, item.name)
+			object.Fields[item.name] = item.value
+		}
+		return value
+	}
+	db, re := callNativeForCoverage(t, v, database, "打开", Text("图书馆.db"))
+	if re != nil {
+		t.Fatal(re)
+	}
+	fields := record(
+		struct {
+			name  string
+			value Value
+		}{"编号", Text("文字")},
+		struct {
+			name  string
+			value Value
+		}{"书名", Text("文字")},
+		struct {
+			name  string
+			value Value
+		}{"页数", Text("整数")},
+		struct {
+			name  string
+			value Value
+		}{"评分", Text("小数")},
+		struct {
+			name  string
+			value Value
+		}{"可借", Text("布尔")},
+		struct {
+			name  string
+			value Value
+		}{"封面", Text("字节串")},
+	)
+	if _, re = callNativeForCoverage(t, v, database, "建表", db, Text("图书"), fields); re != nil {
+		t.Fatal(re)
+	}
+	insert := record(
+		struct {
+			name  string
+			value Value
+		}{"编号", Text("B001")},
+		struct {
+			name  string
+			value Value
+		}{"书名", Text("活着")},
+		struct {
+			name  string
+			value Value
+		}{"页数", Int(240)},
+		struct {
+			name  string
+			value Value
+		}{"评分", Float(9.5)},
+		struct {
+			name  string
+			value Value
+		}{"可借", Bool(true)},
+		struct {
+			name  string
+			value Value
+		}{"封面", Bytes([]byte{1, 2, 3})},
+	)
+	result, re := callNativeForCoverage(t, v, database, "插入", db, Text("图书"), insert)
+	if re != nil {
+		t.Fatal(re)
+	}
+	if got, re := callNativeForCoverage(t, v, database, "受影响行数", result); re != nil || got.Data.(int64) != 1 {
+		t.Fatalf("affected rows=%v,%v", got, re)
+	}
+	condition := record(struct {
+		name  string
+		value Value
+	}{"编号", Text("B001")})
+	row, re := callNativeForCoverage(t, v, database, "选择一行", db, Text("图书"), condition)
+	if re != nil {
+		t.Fatal(re)
+	}
+	if title, re := v.fieldGet(row, "书名", source.Span{}); re != nil || title.Data.(string) != "活着" {
+		t.Fatalf("selected row=%v,%v", title, re)
+	}
+	if _, re := callNativeForCoverage(t, v, database, "更新", db, Text("图书"), record(struct {
+		name  string
+		value Value
+	}{"页数", Int(241)}), condition); re != nil {
+		t.Fatal(re)
+	}
+	rows, re := callNativeForCoverage(t, v, database, "选择", db, Text("图书"))
+	if re != nil || len(rows.Data.(*ListObject).Items) != 1 {
+		t.Fatalf("selected rows=%v,%v", rows, re)
+	}
+	queryFn, ok := v.Globals().Get("选择")
+	if !ok {
+		t.Fatal("query builtin missing")
+	}
+	advanced, re := v.call(queryFn, []Value{db, Text("图书"), Nil(), Text("编号"), Bool(true), Int(1)}, source.Span{})
+	if re != nil || len(advanced.Data.(*ListObject).Items) != 1 {
+		t.Fatalf("advanced query=%v,%v", advanced, re)
+	}
+	if _, re = v.call(queryFn, []Value{db, Text("图书"), Nil(), Nil(), Bool(false), Int(0)}, source.Span{}); re == nil {
+		t.Fatal("zero query limit accepted")
+	}
+	tx, re := callNativeForCoverage(t, v, database, "开始事务", db)
+	if re != nil {
+		t.Fatal(re)
+	}
+	if _, re = callNativeForCoverage(t, v, database, "插入", tx, Text("图书"), record(struct {
+		name  string
+		value Value
+	}{"编号", Text("B002")}, struct {
+		name  string
+		value Value
+	}{"书名", Text("围城")}, struct {
+		name  string
+		value Value
+	}{"页数", Int(300)})); re != nil {
+		t.Fatal(re)
+	}
+	if _, re = callNativeForCoverage(t, v, database, "回滚", tx); re != nil {
+		t.Fatal(re)
+	}
+	tx, re = callNativeForCoverage(t, v, database, "开始事务", db)
+	if re != nil {
+		t.Fatal(re)
+	}
+	if _, re = callNativeForCoverage(t, v, database, "提交", tx); re != nil {
+		t.Fatal(re)
+	}
+	missing, re := callNativeForCoverage(t, v, database, "选择一行", db, Text("图书"), record(struct {
+		name  string
+		value Value
+	}{"编号", Text("B002")}))
+	if re != nil || missing.Kind != NilKind {
+		t.Fatalf("rollback result=%v,%v", missing, re)
+	}
+	if _, re = callNativeForCoverage(t, v, database, "删除", db, Text("图书"), condition); re != nil {
+		t.Fatal(re)
+	}
+	if _, re = callNativeForCoverage(t, v, database, "关闭", db); re != nil {
+		t.Fatal(re)
+	}
+	if _, re = callNativeForCoverage(t, v, database, "选择", db, Text("图书")); re == nil {
+		t.Fatal("closed database accepted query")
+	}
+}
+
+func TestDatabaseHelperBoundaries(t *testing.T) {
+	v := New(&bytes.Buffer{}, strings.NewReader(""), nil)
+	database, ok := StandardModule("标准.数据库", v)
+	if !ok {
+		t.Fatal("database module missing")
+	}
+	for _, name := range []string{"打开", "关闭", "建表", "插入", "选择", "选择一行", "更新", "删除", "开始事务", "提交", "回滚", "最后插入编号", "受影响行数"} {
+		if _, re := callNativeForCoverage(t, v, database, name); re == nil {
+			t.Fatalf("invalid %s call accepted", name)
+		}
+	}
+	db, re := callNativeForCoverage(t, v, database, "打开", Text(":memory:"))
+	if re != nil {
+		t.Fatal(re)
+	}
+	for _, call := range [][]Value{
+		{db, Int(1), Record()},
+		{db, Text("表"), Text("不是记录")},
+		{db, Text("表"), Record()},
+	} {
+		if _, re := callNativeForCoverage(t, v, database, "建表", call...); re == nil {
+			t.Fatal("invalid table definition accepted")
+		}
+	}
+	if _, re := callNativeForCoverage(t, v, database, "关闭", db); re != nil {
+		t.Fatal(re)
+	}
+	db, re = callNativeForCoverage(t, v, database, "打开", Text(":memory:"))
+	if re != nil {
+		t.Fatal(re)
+	}
+	badCalls := []struct {
+		name string
+		args []Value
+	}{
+		{"插入", []Value{db, Text("表"), Text("不是记录")}},
+		{"选择", []Value{db, Text("不存在"), Int(1)}},
+		{"选择一行", []Value{db, Text("不存在"), Int(1)}},
+		{"更新", []Value{db, Text("表"), Text("不是记录")}},
+		{"删除", []Value{db, Text("不存在"), Int(1)}},
+	}
+	for _, call := range badCalls {
+		if _, re := callNativeForCoverage(t, v, database, call.name, call.args...); re == nil {
+			t.Fatalf("invalid %s accepted", call.name)
+		}
+	}
+	if _, re := callNativeForCoverage(t, v, database, "关闭", db); re != nil {
+		t.Fatal(re)
+	}
+	if _, re := quoteDatabaseIdentifier(v, "危险;删除", "表名"); re == nil {
+		t.Fatal("unsafe identifier accepted")
+	}
+	for _, value := range []Value{Nil(), Bool(true), Int(1), Float(1.5), Text("x"), Bytes([]byte{1})} {
+		if _, re := databaseValue(v, value); re != nil {
+			t.Fatalf("database value rejected: %v", re)
+		}
+	}
+	if _, re := databaseValue(v, List(nil)); re == nil {
+		t.Fatal("list database value accepted")
+	}
+	if _, _, re := databaseCondition(v, Int(1)); re == nil {
+		t.Fatal("invalid database condition accepted")
+	}
+	if _, _, re := databaseCondition(v, Record()); re != nil {
+		t.Fatal(re)
+	}
+	for _, value := range []any{nil, int64(1), float64(1), true, "文字", []byte{1}} {
+		if _, re := databaseScanValue(v, value); re != nil {
+			t.Fatalf("scan value rejected: %v", re)
+		}
+	}
+	if _, re := databaseScanValue(v, struct{}{}); re == nil {
+		t.Fatal("unsupported scan value accepted")
+	}
+	if databaseError(v, "测试错误") == nil {
+		t.Fatal("database error was nil")
+	}
+	if _, re := databaseObject(v, Text("不是资源")); re == nil {
+		t.Fatal("text accepted as database")
+	}
+	if _, re := transactionObject(v, Text("不是资源")); re == nil {
+		t.Fatal("text accepted as transaction")
+	}
+	if _, re := databaseRunnerFor(v, Text("不是资源")); re == nil {
+		t.Fatal("text accepted as database runner")
+	}
+	if _, re := databaseQuery(v, failingDatabaseRunner{}, "查询", nil); re == nil {
+		t.Fatal("failing database query did not return error")
+	}
+	if _, re := databaseResult(v, databaseResultError{last: errors.New("编号失败")}); re == nil {
+		t.Fatal("last insert id error was ignored")
+	}
+	if _, re := databaseResult(v, databaseResultError{affected: errors.New("行数失败")}); re == nil {
+		t.Fatal("affected rows error was ignored")
+	}
+	queryFn, ok := v.Globals().Get("选择")
+	if !ok {
+		t.Fatal("query builtin missing")
+	}
+	if _, re := v.call(queryFn, []Value{Text("不是数据库"), Text("表"), Nil(), Nil(), Bool(false), Int(1)}, source.Span{}); re == nil {
+		t.Fatal("invalid query resource accepted")
+	}
+	if _, _, re := databaseCondition(v, Nil()); re != nil {
+		t.Fatal(re)
+	}
+	ordinary, err := v.NewResource("普通资源", &vmResourceCloser{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, re := databaseObject(v, ordinary); re == nil {
+		t.Fatal("ordinary resource accepted as database")
+	}
+	if _, re := transactionObject(v, ordinary); re == nil {
+		t.Fatal("ordinary resource accepted as transaction")
+	}
+	if err := v.CloseResource(ordinary); err != nil {
+		t.Fatal(err)
+	}
+	if (Value{Kind: DatabaseResultKind, Data: &DatabaseResultObject{}}).String() != "<数据库结果>" {
+		t.Fatal("database result formatting failed")
+	}
+	var nilVM *VM
+	if _, err := nilVM.newResource("无效", &vmResourceCloser{}, nil); err == nil {
+		t.Fatal("nil VM accepted resource")
 	}
 }
 

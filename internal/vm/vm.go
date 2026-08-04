@@ -3,6 +3,8 @@ package vm
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -16,32 +18,37 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"huayan/internal/bytecode"
+	"huayan/internal/capability"
 	"huayan/internal/native"
 	"huayan/internal/resource"
 	"huayan/internal/source"
+
+	_ "modernc.org/sqlite"
 )
 
 type Kind string
 
 const (
-	NilKind      Kind = "空"
-	BoolKind     Kind = "布尔"
-	IntKind      Kind = "整数"
-	FloatKind    Kind = "小数"
-	StringKind   Kind = "文字"
-	BytesKind    Kind = "字节串"
-	ListKind     Kind = "列表"
-	DictKind     Kind = "字典"
-	RecordKind   Kind = "记录"
-	FunctionKind Kind = "函数"
-	NativeKind   Kind = "原生函数"
-	ModuleKind   Kind = "模块"
-	ErrorKind    Kind = "错误"
-	IteratorKind Kind = "迭代器"
-	ResourceKind Kind = "资源"
+	NilKind            Kind = "空"
+	BoolKind           Kind = "布尔"
+	IntKind            Kind = "整数"
+	FloatKind          Kind = "小数"
+	StringKind         Kind = "文字"
+	BytesKind          Kind = "字节串"
+	ListKind           Kind = "列表"
+	DictKind           Kind = "字典"
+	RecordKind         Kind = "记录"
+	FunctionKind       Kind = "函数"
+	NativeKind         Kind = "原生函数"
+	ModuleKind         Kind = "模块"
+	ErrorKind          Kind = "错误"
+	IteratorKind       Kind = "迭代器"
+	ResourceKind       Kind = "资源"
+	DatabaseResultKind Kind = "数据库结果"
 )
 
 type Value struct {
@@ -170,6 +177,8 @@ func formatValue(v Value, seen map[any]bool) string {
 	case ResourceKind:
 		r := v.Data.(*ResourceObject)
 		return "<资源 " + r.Name + ">"
+	case DatabaseResultKind:
+		return "<数据库结果>"
 	default:
 		return "<" + string(v.Kind) + ">"
 	}
@@ -191,9 +200,29 @@ type ModuleObject struct {
 	Exports map[string]Value
 }
 type ResourceObject struct {
-	Handle resource.Handle
-	Name   string
+	Handle  resource.Handle
+	Name    string
+	Payload any
 }
+type DatabaseObject struct{ DB *sql.DB }
+type TransactionObject struct{ Tx *sql.Tx }
+type DatabaseResultObject struct {
+	LastInsertID int64
+	RowsAffected int64
+}
+type transactionCloser struct{ tx *sql.Tx }
+
+func (c *transactionCloser) Close() error {
+	if c == nil || c.tx == nil {
+		return nil
+	}
+	err := c.tx.Rollback()
+	if err == sql.ErrTxDone {
+		return nil
+	}
+	return err
+}
+
 type ErrorObject struct {
 	Category, Message string
 	Span              source.Span
@@ -357,6 +386,7 @@ type VM struct {
 	Args          []string
 	Loader        ModuleLoader
 	NativeModules *native.Registry
+	Capabilities  capability.Set
 	Resources     *resource.Manager
 	modules       map[string]Value
 	frames        []CallFrame
@@ -379,6 +409,7 @@ func New(out io.Writer, in io.Reader, args []string) *VM {
 	v := &VM{
 		Out: out, In: in, Args: args,
 		NativeModules: defaultNativeModules(),
+		Capabilities:  capability.AllowAll(),
 		Resources:     resource.NewManager(),
 		modules:       map[string]Value{},
 		MaxCallDepth:  1024, MaxStackDepth: 1 << 20,
@@ -399,6 +430,7 @@ func defaultNativeModules() *native.Registry {
 		{Name: "标准.列表"},
 		{Name: "标准.字典"},
 		{Name: "标准.文件", Capabilities: []native.Capability{native.CapabilityFileRead, native.CapabilityFileWrite}},
+		{Name: "标准.数据库", Capabilities: []native.Capability{native.CapabilityDatabase}},
 		{Name: "标准.JSON"},
 		{Name: "标准.时间"},
 		{Name: "标准.数学"},
@@ -424,6 +456,17 @@ func (v *VM) NewResource(name string, closer io.Closer) (Value, error) {
 	return Value{Kind: ResourceKind, Data: &ResourceObject{Handle: handle, Name: name}}, nil
 }
 
+func (v *VM) newResource(name string, closer io.Closer, payload any) (Value, error) {
+	if v == nil || v.Resources == nil {
+		return Nil(), resource.ErrInvalidHandle
+	}
+	handle, err := v.Resources.Register(name, closer)
+	if err != nil {
+		return Nil(), err
+	}
+	return Value{Kind: ResourceKind, Data: &ResourceObject{Handle: handle, Name: name, Payload: payload}}, nil
+}
+
 func (v *VM) CloseResource(value Value) error {
 	if value.Kind != ResourceKind {
 		return resource.ErrInvalidHandle
@@ -440,6 +483,13 @@ func (v *VM) CloseResources() []error {
 		return nil
 	}
 	return v.Resources.CloseAll()
+}
+
+func (v *VM) requireCapability(required native.Capability, action string) *RuntimeError {
+	if v.Capabilities.Allows(required) {
+		return nil
+	}
+	return v.fault("权限错误", action+"需要权限："+string(required), source.Span{})
 }
 func (v *VM) Globals() *Env { return v.globals }
 func (v *VM) Execute(ch *bytecode.Chunk, env *Env) (result Value, runErr *RuntimeError) {
@@ -1559,6 +1609,9 @@ func (v *VM) installBuiltins() {
 		}
 		return Nil(), vm.fault("断言错误", msg, source.Span{})
 	}), false)
+	v.globals.Define("选择", v.native("选择", func(vm *VM, args []Value) (Value, *RuntimeError) {
+		return databaseSelect(vm, args)
+	}), false)
 }
 func (v *VM) native(name string, fn NativeFunc) Value {
 	return Value{Kind: NativeKind, Data: &NativeObject{Name: name, Fn: fn}}
@@ -1713,6 +1766,281 @@ func bytesArg(args []Value, i int, name string, vm *VM) ([]byte, *RuntimeError) 
 		return nil, vm.fault("类型错误", name+"的参数必须是字节串", source.Span{})
 	}
 	return args[i].Data.(*BytesObject).Data, nil
+}
+
+type databaseRunner interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func databaseError(vm *VM, message string) *RuntimeError {
+	return vm.fault("数据库错误", message, source.Span{})
+}
+
+func databaseValue(vm *VM, value Value) (any, *RuntimeError) {
+	switch value.Kind {
+	case NilKind:
+		return nil, nil
+	case BoolKind:
+		return value.Data.(bool), nil
+	case IntKind:
+		return value.Data.(int64), nil
+	case FloatKind:
+		return value.Data.(float64), nil
+	case StringKind:
+		return value.Data.(string), nil
+	case BytesKind:
+		return append([]byte(nil), value.Data.(*BytesObject).Data...), nil
+	default:
+		return nil, vm.fault("类型错误", "数据库值只能是空、布尔、整数、小数、文字或字节串", source.Span{})
+	}
+}
+
+func safeDatabaseIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 {
+			if r != '_' && !unicode.IsLetter(r) {
+				return false
+			}
+			continue
+		}
+		if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func quoteDatabaseIdentifier(vm *VM, name, role string) (string, *RuntimeError) {
+	if !safeDatabaseIdentifier(name) {
+		return "", databaseError(vm, role+"不是合法的中文数据库标识符")
+	}
+	return `"` + name + `"`, nil
+}
+
+func databaseObject(vm *VM, value Value) (*DatabaseObject, *RuntimeError) {
+	if value.Kind != ResourceKind {
+		return nil, vm.fault("类型错误", "需要数据库资源", source.Span{})
+	}
+	object, ok := value.Data.(*ResourceObject)
+	if !ok || !vm.Resources.IsOpen(object.Handle) {
+		return nil, vm.fault("资源错误", "数据库资源已经关闭或无效", source.Span{})
+	}
+	database, ok := object.Payload.(*DatabaseObject)
+	if !ok || database.DB == nil {
+		return nil, vm.fault("类型错误", "资源不是数据库资源", source.Span{})
+	}
+	return database, nil
+}
+
+func transactionObject(vm *VM, value Value) (*TransactionObject, *RuntimeError) {
+	if value.Kind != ResourceKind {
+		return nil, vm.fault("类型错误", "需要事务资源", source.Span{})
+	}
+	object, ok := value.Data.(*ResourceObject)
+	if !ok || !vm.Resources.IsOpen(object.Handle) {
+		return nil, vm.fault("资源错误", "事务资源已经关闭或无效", source.Span{})
+	}
+	transaction, ok := object.Payload.(*TransactionObject)
+	if !ok || transaction.Tx == nil {
+		return nil, vm.fault("类型错误", "资源不是事务资源", source.Span{})
+	}
+	return transaction, nil
+}
+
+func databaseRunnerFor(vm *VM, value Value) (databaseRunner, *RuntimeError) {
+	if value.Kind != ResourceKind {
+		return nil, vm.fault("类型错误", "需要数据库或事务资源", source.Span{})
+	}
+	object, ok := value.Data.(*ResourceObject)
+	if !ok || !vm.Resources.IsOpen(object.Handle) {
+		return nil, vm.fault("资源错误", "数据库资源已经关闭或无效", source.Span{})
+	}
+	if database, ok := object.Payload.(*DatabaseObject); ok && database.DB != nil {
+		return database.DB, nil
+	}
+	if transaction, ok := object.Payload.(*TransactionObject); ok && transaction.Tx != nil {
+		return transaction.Tx, nil
+	}
+	return nil, vm.fault("类型错误", "资源不是数据库或事务资源", source.Span{})
+}
+
+func databaseResult(vm *VM, result sql.Result) (Value, *RuntimeError) {
+	last, err := result.LastInsertId()
+	if err != nil {
+		return Nil(), databaseError(vm, "读取最后插入编号失败："+err.Error())
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return Nil(), databaseError(vm, "读取受影响行数失败："+err.Error())
+	}
+	return Value{Kind: DatabaseResultKind, Data: &DatabaseResultObject{LastInsertID: last, RowsAffected: rows}}, nil
+}
+
+func databaseCondition(vm *VM, condition Value) (string, []any, *RuntimeError) {
+	if condition.Kind == NilKind {
+		return "", nil, nil
+	}
+	if condition.Kind != RecordKind {
+		return "", nil, vm.fault("类型错误", "数据库条件必须是记录或空", source.Span{})
+	}
+	record := condition.Data.(*RecordObject)
+	if len(record.Order) == 0 {
+		return "", nil, nil
+	}
+	parts := make([]string, 0, len(record.Order))
+	args := make([]any, 0, len(record.Order))
+	for _, name := range record.Order {
+		quoted, re := quoteDatabaseIdentifier(vm, name, "条件字段")
+		if re != nil {
+			return "", nil, re
+		}
+		value, re := databaseValue(vm, record.Fields[name])
+		if re != nil {
+			return "", nil, re
+		}
+		if value == nil {
+			parts = append(parts, quoted+" IS NULL")
+		} else {
+			parts = append(parts, quoted+" = ?")
+			args = append(args, value)
+		}
+	}
+	return " WHERE " + strings.Join(parts, " AND "), args, nil
+}
+
+func databaseRecord(vm *VM, rows *sql.Rows, columns []string) (Value, *RuntimeError) {
+	seen := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		if seen[column] {
+			return Nil(), databaseError(vm, "查询结果包含重复字段“"+column+"”")
+		}
+		seen[column] = true
+	}
+	values := make([]any, len(columns))
+	dest := make([]any, len(columns))
+	for i := range values {
+		dest[i] = &values[i]
+	}
+	if err := rows.Scan(dest...); err != nil {
+		return Nil(), databaseError(vm, "读取查询结果失败："+err.Error())
+	}
+	result := Record()
+	record := result.Data.(*RecordObject)
+	for i, column := range columns {
+		value, re := databaseScanValue(vm, values[i])
+		if re != nil {
+			return Nil(), re
+		}
+		record.Order = append(record.Order, column)
+		record.Fields[column] = value
+		_ = i
+	}
+	return result, nil
+}
+
+func databaseScanValue(vm *VM, value any) (Value, *RuntimeError) {
+	switch x := value.(type) {
+	case nil:
+		return Nil(), nil
+	case int64:
+		return Int(x), nil
+	case float64:
+		return Float(x), nil
+	case bool:
+		return Bool(x), nil
+	case string:
+		return Text(x), nil
+	case []byte:
+		return Bytes(x), nil
+	default:
+		return Nil(), databaseError(vm, "数据库返回了不支持的值类型")
+	}
+}
+
+func databaseQuery(vm *VM, runner databaseRunner, query string, args []any) (Value, *RuntimeError) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := runner.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Nil(), databaseError(vm, "查询失败："+err.Error())
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return Nil(), databaseError(vm, "读取字段失败："+err.Error())
+	}
+	items := make([]Value, 0)
+	for len(items) < 10000 && rows.Next() {
+		item, re := databaseRecord(vm, rows, columns)
+		if re != nil {
+			return Nil(), re
+		}
+		items = append(items, item)
+	}
+	if rows.Err() != nil {
+		return Nil(), databaseError(vm, "读取查询结果失败："+rows.Err().Error())
+	}
+	if len(items) == 10000 && rows.Next() {
+		return Nil(), databaseError(vm, "查询结果超过 10000 行限制")
+	}
+	return List(items), nil
+}
+
+func databaseSelect(vm *VM, args []Value) (Value, *RuntimeError) {
+	if len(args) < 2 || len(args) > 6 {
+		return Nil(), vm.argError("选择", 2, len(args), source.Span{})
+	}
+	runner, re := databaseRunnerFor(vm, args[0])
+	if re != nil {
+		return Nil(), re
+	}
+	table, re := stringArg(args, 1, "选择", vm)
+	if re != nil {
+		return Nil(), re
+	}
+	quotedTable, re := quoteDatabaseIdentifier(vm, table, "表名")
+	if re != nil {
+		return Nil(), re
+	}
+	condition := Nil()
+	if len(args) >= 3 {
+		condition = args[2]
+	}
+	where, values, re := databaseCondition(vm, condition)
+	if re != nil {
+		return Nil(), re
+	}
+	query := "SELECT * FROM " + quotedTable + where
+	if len(args) >= 4 && args[3].Kind != NilKind {
+		field, x := stringArg(args, 3, "排序", vm)
+		if x != nil {
+			return Nil(), x
+		}
+		quotedField, x := quoteDatabaseIdentifier(vm, field, "排序字段")
+		if x != nil {
+			return Nil(), x
+		}
+		direction := " ASC"
+		if len(args) >= 5 && args[4].Kind == BoolKind && args[4].Data.(bool) {
+			direction = " DESC"
+		}
+		query += " ORDER BY " + quotedField + direction
+	}
+	if len(args) >= 6 && args[5].Kind != NilKind {
+		if args[5].Kind != IntKind {
+			return Nil(), vm.fault("类型错误", "限制必须是整数", source.Span{})
+		}
+		limit := args[5].Data.(int64)
+		if limit <= 0 || limit > 10000 {
+			return Nil(), databaseError(vm, "限制必须在 1 到 10000 之间")
+		}
+		query += " LIMIT " + strconv.FormatInt(limit, 10)
+	}
+	return databaseQuery(vm, runner, query, values)
 }
 
 // StandardModule is kept inside the VM so native functions receive the same
@@ -1903,8 +2231,342 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			}
 			return List(items), nil
 		}))
+	case "标准.数据库":
+		export(m, "打开", v.native("数据库.打开", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityDatabase, "打开数据库"); re != nil {
+				return Nil(), re
+			}
+			path, re := stringArg(args, 0, "打开", vm)
+			if re != nil {
+				return Nil(), re
+			}
+			if path != ":memory:" {
+				path = vm.filePath(path)
+			}
+			database, err := sql.Open("sqlite", path)
+			if err == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				err = database.PingContext(ctx)
+				cancel()
+			}
+			if err != nil {
+				if database != nil {
+					_ = database.Close()
+				}
+				return Nil(), databaseError(vm, "打开数据库失败："+err.Error())
+			}
+			value, err := vm.newResource("数据库", database, &DatabaseObject{DB: database})
+			if err != nil {
+				_ = database.Close()
+				return Nil(), databaseError(vm, "注册数据库资源失败："+err.Error())
+			}
+			return value, nil
+		}))
+		export(m, "关闭", v.native("数据库.关闭", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) != 1 {
+				return Nil(), vm.argError("关闭", 1, len(args), source.Span{})
+			}
+			if _, re := databaseObject(vm, args[0]); re != nil {
+				return Nil(), re
+			}
+			if err := vm.CloseResource(args[0]); err != nil {
+				return Nil(), databaseError(vm, "关闭数据库失败："+err.Error())
+			}
+			return Nil(), nil
+		}))
+		export(m, "建表", v.native("数据库.建表", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) != 3 {
+				return Nil(), vm.argError("建表", 3, len(args), source.Span{})
+			}
+			runner, re := databaseRunnerFor(vm, args[0])
+			if re != nil {
+				return Nil(), re
+			}
+			table, re := stringArg(args, 1, "建表", vm)
+			if re != nil {
+				return Nil(), re
+			}
+			quotedTable, re := quoteDatabaseIdentifier(vm, table, "表名")
+			if re != nil {
+				return Nil(), re
+			}
+			if args[2].Kind != RecordKind {
+				return Nil(), vm.fault("类型错误", "字段定义必须是记录", source.Span{})
+			}
+			fields := args[2].Data.(*RecordObject)
+			if len(fields.Order) == 0 {
+				return Nil(), databaseError(vm, "字段定义不能为空")
+			}
+			definitions := make([]string, 0, len(fields.Order))
+			for _, name := range fields.Order {
+				column, x := quoteDatabaseIdentifier(vm, name, "字段名")
+				if x != nil {
+					return Nil(), x
+				}
+				if fields.Fields[name].Kind != StringKind {
+					return Nil(), vm.fault("类型错误", "字段类型必须是文字", source.Span{})
+				}
+				typeName := fields.Fields[name].Data.(string)
+				switch typeName {
+				case "文字":
+					typeName = "TEXT"
+				case "整数", "布尔":
+					typeName = "INTEGER"
+				case "小数":
+					typeName = "REAL"
+				case "字节串":
+					typeName = "BLOB"
+				default:
+					return Nil(), databaseError(vm, "不支持的字段类型："+typeName)
+				}
+				definitions = append(definitions, column+" "+typeName)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := runner.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS "+quotedTable+" ("+strings.Join(definitions, ", ")+")")
+			cancel()
+			if err != nil {
+				return Nil(), databaseError(vm, "建表失败："+err.Error())
+			}
+			return Nil(), nil
+		}))
+		export(m, "插入", v.native("数据库.插入", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) != 3 {
+				return Nil(), vm.argError("插入", 3, len(args), source.Span{})
+			}
+			runner, re := databaseRunnerFor(vm, args[0])
+			if re != nil {
+				return Nil(), re
+			}
+			table, re := stringArg(args, 1, "插入", vm)
+			if re != nil {
+				return Nil(), re
+			}
+			quotedTable, re := quoteDatabaseIdentifier(vm, table, "表名")
+			if re != nil {
+				return Nil(), re
+			}
+			if args[2].Kind != RecordKind {
+				return Nil(), vm.fault("类型错误", "插入内容必须是记录", source.Span{})
+			}
+			record := args[2].Data.(*RecordObject)
+			if len(record.Order) == 0 {
+				return Nil(), databaseError(vm, "插入记录不能为空")
+			}
+			columns, placeholders, values := make([]string, 0, len(record.Order)), make([]string, 0, len(record.Order)), make([]any, 0, len(record.Order))
+			for _, name := range record.Order {
+				column, x := quoteDatabaseIdentifier(vm, name, "字段名")
+				if x != nil {
+					return Nil(), x
+				}
+				value, x := databaseValue(vm, record.Fields[name])
+				if x != nil {
+					return Nil(), x
+				}
+				columns = append(columns, column)
+				placeholders = append(placeholders, "?")
+				values = append(values, value)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			result, err := runner.ExecContext(ctx, "INSERT INTO "+quotedTable+" ("+strings.Join(columns, ", ")+") VALUES ("+strings.Join(placeholders, ", ")+")", values...)
+			cancel()
+			if err != nil {
+				return Nil(), databaseError(vm, "插入失败："+err.Error())
+			}
+			return databaseResult(vm, result)
+		}))
+		export(m, "选择", v.native("数据库.选择", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			return databaseSelect(vm, args)
+		}))
+		export(m, "选择一行", v.native("数据库.选择一行", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) < 2 || len(args) > 3 {
+				return Nil(), vm.argError("选择一行", 2, len(args), source.Span{})
+			}
+			runner, re := databaseRunnerFor(vm, args[0])
+			if re != nil {
+				return Nil(), re
+			}
+			table, re := stringArg(args, 1, "选择一行", vm)
+			if re != nil {
+				return Nil(), re
+			}
+			quotedTable, re := quoteDatabaseIdentifier(vm, table, "表名")
+			if re != nil {
+				return Nil(), re
+			}
+			condition := Nil()
+			if len(args) == 3 {
+				condition = args[2]
+			}
+			where, values, re := databaseCondition(vm, condition)
+			if re != nil {
+				return Nil(), re
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			rows, err := runner.QueryContext(ctx, "SELECT * FROM "+quotedTable+where+" LIMIT 1", values...)
+			if err != nil {
+				return Nil(), databaseError(vm, "查询失败："+err.Error())
+			}
+			defer rows.Close()
+			columns, err := rows.Columns()
+			if err != nil {
+				return Nil(), databaseError(vm, "读取字段失败："+err.Error())
+			}
+			if !rows.Next() {
+				if rows.Err() != nil {
+					return Nil(), databaseError(vm, "读取查询结果失败："+rows.Err().Error())
+				}
+				return Nil(), nil
+			}
+			return databaseRecord(vm, rows, columns)
+		}))
+		export(m, "更新", v.native("数据库.更新", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) < 3 || len(args) > 4 {
+				return Nil(), vm.argError("更新", 3, len(args), source.Span{})
+			}
+			runner, re := databaseRunnerFor(vm, args[0])
+			if re != nil {
+				return Nil(), re
+			}
+			table, re := stringArg(args, 1, "更新", vm)
+			if re != nil {
+				return Nil(), re
+			}
+			quotedTable, re := quoteDatabaseIdentifier(vm, table, "表名")
+			if re != nil {
+				return Nil(), re
+			}
+			if args[2].Kind != RecordKind {
+				return Nil(), vm.fault("类型错误", "修改内容必须是记录", source.Span{})
+			}
+			changes := args[2].Data.(*RecordObject)
+			if len(changes.Order) == 0 {
+				return Nil(), databaseError(vm, "修改记录不能为空")
+			}
+			sets, values := make([]string, 0, len(changes.Order)), make([]any, 0, len(changes.Order))
+			for _, name := range changes.Order {
+				column, x := quoteDatabaseIdentifier(vm, name, "字段名")
+				if x != nil {
+					return Nil(), x
+				}
+				value, x := databaseValue(vm, changes.Fields[name])
+				if x != nil {
+					return Nil(), x
+				}
+				sets = append(sets, column+" = ?")
+				values = append(values, value)
+			}
+			condition := Nil()
+			if len(args) == 4 {
+				condition = args[3]
+			}
+			where, conditionValues, re := databaseCondition(vm, condition)
+			if re != nil {
+				return Nil(), re
+			}
+			values = append(values, conditionValues...)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			result, err := runner.ExecContext(ctx, "UPDATE "+quotedTable+" SET "+strings.Join(sets, ", ")+where, values...)
+			cancel()
+			if err != nil {
+				return Nil(), databaseError(vm, "更新失败："+err.Error())
+			}
+			return databaseResult(vm, result)
+		}))
+		export(m, "删除", v.native("数据库.删除", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) < 2 || len(args) > 3 {
+				return Nil(), vm.argError("删除", 2, len(args), source.Span{})
+			}
+			runner, re := databaseRunnerFor(vm, args[0])
+			if re != nil {
+				return Nil(), re
+			}
+			table, re := stringArg(args, 1, "删除", vm)
+			if re != nil {
+				return Nil(), re
+			}
+			quotedTable, re := quoteDatabaseIdentifier(vm, table, "表名")
+			if re != nil {
+				return Nil(), re
+			}
+			condition := Nil()
+			if len(args) == 3 {
+				condition = args[2]
+			}
+			where, values, re := databaseCondition(vm, condition)
+			if re != nil {
+				return Nil(), re
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			result, err := runner.ExecContext(ctx, "DELETE FROM "+quotedTable+where, values...)
+			cancel()
+			if err != nil {
+				return Nil(), databaseError(vm, "删除失败："+err.Error())
+			}
+			return databaseResult(vm, result)
+		}))
+		export(m, "最后插入编号", v.native("数据库.最后插入编号", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) != 1 || args[0].Kind != DatabaseResultKind {
+				return Nil(), vm.fault("类型错误", "最后插入编号需要数据库执行结果", source.Span{})
+			}
+			return Int(args[0].Data.(*DatabaseResultObject).LastInsertID), nil
+		}))
+		export(m, "受影响行数", v.native("数据库.受影响行数", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) != 1 || args[0].Kind != DatabaseResultKind {
+				return Nil(), vm.fault("类型错误", "受影响行数需要数据库执行结果", source.Span{})
+			}
+			return Int(args[0].Data.(*DatabaseResultObject).RowsAffected), nil
+		}))
+		export(m, "开始事务", v.native("数据库.开始事务", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) != 1 {
+				return Nil(), vm.argError("开始事务", 1, len(args), source.Span{})
+			}
+			database, re := databaseObject(vm, args[0])
+			if re != nil {
+				return Nil(), re
+			}
+			tx, err := database.DB.Begin()
+			if err != nil {
+				return Nil(), databaseError(vm, "开始事务失败："+err.Error())
+			}
+			value, err := vm.newResource("数据库事务", &transactionCloser{tx: tx}, &TransactionObject{Tx: tx})
+			if err != nil {
+				_ = tx.Rollback()
+				return Nil(), databaseError(vm, "注册事务资源失败："+err.Error())
+			}
+			return value, nil
+		}))
+		export(m, "提交", v.native("数据库.提交", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) != 1 {
+				return Nil(), vm.argError("提交", 1, len(args), source.Span{})
+			}
+			transaction, re := transactionObject(vm, args[0])
+			if re != nil {
+				return Nil(), re
+			}
+			if err := transaction.Tx.Commit(); err != nil {
+				return Nil(), databaseError(vm, "提交事务失败："+err.Error())
+			}
+			_ = vm.CloseResource(args[0])
+			return Nil(), nil
+		}))
+		export(m, "回滚", v.native("数据库.回滚", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if len(args) != 1 {
+				return Nil(), vm.argError("回滚", 1, len(args), source.Span{})
+			}
+			if _, re := transactionObject(vm, args[0]); re != nil {
+				return Nil(), re
+			}
+			if err := vm.CloseResource(args[0]); err != nil {
+				return Nil(), databaseError(vm, "回滚事务失败："+err.Error())
+			}
+			return Nil(), nil
+		}))
 	case "标准.文件":
 		export(m, "读取文字", v.native("文件.读取文字", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileRead, "读取文字"); re != nil {
+				return Nil(), re
+			}
 			p, e := stringArg(args, 0, "读取文字", vm)
 			if e != nil {
 				return Nil(), e
@@ -1916,6 +2578,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return Text(string(b)), nil
 		}))
 		export(m, "写入文字", v.native("文件.写入文字", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileWrite, "写入文字"); re != nil {
+				return Nil(), re
+			}
 			if len(args) != 2 {
 				return Nil(), vm.argError("写入文字", 2, len(args), source.Span{})
 			}
@@ -1933,6 +2598,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return Nil(), nil
 		}))
 		export(m, "读取字节", v.native("文件.读取字节", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileRead, "读取字节"); re != nil {
+				return Nil(), re
+			}
 			p, e := stringArg(args, 0, "读取字节", vm)
 			if e != nil {
 				return Nil(), e
@@ -1944,6 +2612,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return Bytes(b), nil
 		}))
 		export(m, "写入字节", v.native("文件.写入字节", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileWrite, "写入字节"); re != nil {
+				return Nil(), re
+			}
 			if len(args) != 2 {
 				return Nil(), vm.argError("写入字节", 2, len(args), source.Span{})
 			}
@@ -1961,6 +2632,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return Nil(), nil
 		}))
 		export(m, "追加文字", v.native("文件.追加文字", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileWrite, "追加文字"); re != nil {
+				return Nil(), re
+			}
 			if len(args) != 2 {
 				return Nil(), vm.argError("追加文字", 2, len(args), source.Span{})
 			}
@@ -1983,6 +2657,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return Nil(), nil
 		}))
 		export(m, "存在", v.native("文件.存在", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileRead, "存在"); re != nil {
+				return Nil(), re
+			}
 			p, e := stringArg(args, 0, "存在", vm)
 			if e != nil {
 				return Nil(), e
@@ -1991,6 +2668,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return Bool(x == nil), nil
 		}))
 		export(m, "创建目录", v.native("文件.创建目录", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileWrite, "创建目录"); re != nil {
+				return Nil(), re
+			}
 			p, e := stringArg(args, 0, "创建目录", vm)
 			if e != nil {
 				return Nil(), e
@@ -2001,6 +2681,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return Nil(), nil
 		}))
 		export(m, "原子写入", v.native("文件.原子写入", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileWrite, "原子写入"); re != nil {
+				return Nil(), re
+			}
 			if len(args) != 2 {
 				return Nil(), vm.argError("原子写入", 2, len(args), source.Span{})
 			}
@@ -2042,6 +2725,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return Nil(), nil
 		}))
 		export(m, "原子写入组", v.native("文件.原子写入组", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityFileWrite, "原子写入组"); re != nil {
+				return Nil(), re
+			}
 			if err := vm.atomicBatchWrite(args); err != nil {
 				return Nil(), err
 			}
@@ -2215,6 +2901,9 @@ func StandardModule(path string, v *VM) (Value, bool) {
 			return List(a), nil
 		}))
 		export(m, "环境", v.native("程序.环境", func(vm *VM, args []Value) (Value, *RuntimeError) {
+			if re := vm.requireCapability(native.CapabilityEnvRead, "环境"); re != nil {
+				return Nil(), re
+			}
 			d := Dict()
 			for _, kv := range os.Environ() {
 				parts := strings.SplitN(kv, "=", 2)

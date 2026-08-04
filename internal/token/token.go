@@ -65,13 +65,20 @@ const (
 	Finally
 	Throw
 	Record
+	Select
+	Where
+	OrderBy
+	Ascending
+	Descending
+	Limit
+	Equals
 )
 
 var names = map[Kind]string{
 	EOF: "文件结束", Newline: "换行", Identifier: "标识符", Integer: "整数", Float: "小数", String: "文字",
 	LeftParen: "(", RightParen: ")", LeftBracket: "[", RightBracket: "]", LeftBrace: "{", RightBrace: "}", Comma: ",", Colon: ":", Dot: ".", Semicolon: ";",
 	Plus: "+", Minus: "-", Star: "*", Slash: "/", Percent: "%", Assign: "=", Equal: "==", NotEqual: "!=", Less: "<", LessEqual: "<=", Greater: ">", GreaterEqual: ">=",
-	Module: "模块", Import: "导入", From: "从", As: "为", Export: "公开", Let: "让", Const: "常量", Function: "函数", Return: "返回", If: "如果", Else: "否则", ElseIf: "否则如果", End: "结束", While: "当", For: "遍历", In: "于", Break: "跳出", Continue: "继续", True: "真", False: "假", Nil: "空", And: "且", Or: "或", Not: "非", Try: "尝试", Catch: "捕获", Finally: "最后", Throw: "抛出", Record: "记录",
+	Module: "模块", Import: "导入", From: "从", As: "为", Export: "公开", Let: "让", Const: "常量", Function: "函数", Return: "返回", If: "如果", Else: "否则", ElseIf: "否则如果", End: "结束", While: "当", For: "遍历", In: "于", Break: "跳出", Continue: "继续", True: "真", False: "假", Nil: "空", And: "且", Or: "或", Not: "非", Try: "尝试", Catch: "捕获", Finally: "最后", Throw: "抛出", Record: "记录", Select: "选择", Where: "其中", OrderBy: "排序", Ascending: "升序", Descending: "降序", Limit: "限制", Equals: "等于",
 }
 
 func (k Kind) String() string {

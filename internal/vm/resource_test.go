@@ -3,6 +3,7 @@ package vm
 import (
 	"testing"
 
+	"huayan/internal/capability"
 	"huayan/internal/native"
 )
 
@@ -46,6 +47,31 @@ func TestVMRegistersNativeModulesAndOwnsResources(t *testing.T) {
 	}
 	if err := v.CloseResource(value); err != nil {
 		t.Fatal("resource close should be idempotent:", err)
+	}
+}
+
+func TestVMCapabilityContextDeniesRestrictedOperations(t *testing.T) {
+	v := New(nil, nil, nil)
+	v.Capabilities = capability.New(native.CapabilityFileRead)
+	files, ok := StandardModule("标准.文件", v)
+	if !ok {
+		t.Fatal("file module missing")
+	}
+	if _, re := callNativeForCoverage(t, v, files, "写入文字", Text("禁止.txt"), Text("内容")); re == nil || re.Value.Data.(*ErrorObject).Category != "权限错误" {
+		t.Fatalf("write permission error=%v", re)
+	}
+	program, ok := StandardModule("标准.程序", v)
+	if !ok {
+		t.Fatal("program module missing")
+	}
+	if _, re := callNativeForCoverage(t, v, program, "环境"); re == nil || re.Value.Data.(*ErrorObject).Category != "权限错误" {
+		t.Fatalf("environment permission error=%v", re)
+	}
+	v.Capabilities = capability.New()
+	for _, name := range []string{"读取文字", "读取字节", "存在", "写入文字", "写入字节", "追加文字", "创建目录", "原子写入", "原子写入组"} {
+		if _, re := callNativeForCoverage(t, v, files, name); re == nil || re.Value.Data.(*ErrorObject).Category != "权限错误" {
+			t.Fatalf("%s permission error=%v", name, re)
+		}
 	}
 }
 

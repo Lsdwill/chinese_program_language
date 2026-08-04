@@ -57,6 +57,11 @@ func TestDumpCoversAllLanguageNodeShapes(t *testing.T) {
 结束
 值[0] = 2
 记录值.名 = "新名"
+让 查询结果 = 选择 图书 从 库
+    其中 编号 等于 "B001"
+    排序 书名 降序
+    限制 5
+结束
 `}
 	ts, le := lexer.Lex(f)
 	if len(le) != 0 {
@@ -67,7 +72,7 @@ func TestDumpCoversAllLanguageNodeShapes(t *testing.T) {
 		t.Fatal(pe)
 	}
 	got := ast.Dump(p)
-	for _, want := range []string{"模块=示例.主", "导入 标准.文字", "常量 版本", "函数 运行", "条件", "循环", "遍历 项", "尝试 原因", "抛出", "列表", "字典", "记录", "索引", "字段", "赋值"} {
+	for _, want := range []string{"模块=示例.主", "导入 标准.文字", "常量 版本", "函数 运行", "条件", "循环", "遍历 项", "尝试 原因", "抛出", "列表", "字典", "记录", "索引", "字段", "赋值", "查询 图书", "其中 编号", "排序 书名", "限制"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("dump missing %q:\n%s", want, got)
 		}

@@ -27,6 +27,11 @@ func TestParserRecoveryAndExpressionForms(t *testing.T) {
 	if _, ds := Parse(ts); len(ds) != 0 || !strings.Contains(valid, "解析") {
 		t.Fatalf("valid parse diagnostics=%v", ds)
 	}
+	query := "让 结果 = 选择 图书 从 库\n其中 编号 等于 \"B001\"\n排序 书名 降序\n限制 5\n结束"
+	qt, _ := lexer.Lex(&source.File{Name: "query.hua", Text: query})
+	if program, ds := Parse(qt); len(ds) != 0 || len(program.Statements) != 1 {
+		t.Fatalf("query parse diagnostics=%v program=%#v", ds, program)
+	}
 }
 
 func FuzzParserNeverPanics(f *testing.F) {

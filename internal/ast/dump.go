@@ -171,6 +171,20 @@ func dumpExpr(b *strings.Builder, e Expr, in string) {
 			dumpExpr(b, p.Key, in+"  ")
 			dumpExpr(b, p.Value, in+"  ")
 		}
+	case *Query:
+		line(b, in, "查询", x.Table)
+		dumpExpr(b, x.Database, in+"  ")
+		if x.WhereField != "" {
+			line(b, in+"  ", "其中", x.WhereField)
+			dumpExpr(b, x.WhereValue, in+"    ")
+		}
+		if x.OrderField != "" {
+			line(b, in+"  ", "排序", x.OrderField)
+		}
+		if x.Limit != nil {
+			line(b, in+"  ", "限制")
+			dumpExpr(b, x.Limit, in+"    ")
+		}
 	default:
 		line(b, in, fmt.Sprintf("<未知表达式 %T>", e))
 	}
