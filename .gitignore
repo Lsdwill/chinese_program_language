@@ -1,3 +1,6 @@
 /huayan
 图书馆数据.json
 *.hua.json
+examples/数据库/数据/
+dist/huayan-v0.4.0/
+dist/huayan-v0.4.0-SHA256SUMS

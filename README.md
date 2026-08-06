@@ -152,6 +152,7 @@ internal/engine/  文件加载、模块解析和执行入口
 internal/formatter/源码格式化器
 tests/conformance/语言一致性测试
 examples/图书馆/  完整应用示例
+examples/数据库/  中文数据库连接和查询示例
 docs/             教程、规范、ADR 和 API 文档
 ```
 
