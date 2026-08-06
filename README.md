@@ -1,6 +1,36 @@
-# 华言 v0.4.0 开发中
+# 华言 v0.4.0
 
-华言（Huayan）是一门使用中文关键字的独立脚本语言。仓库包含 UTF-8 Lexer、递归下降/Pratt Parser、Resolver、局部槽位/Upvalue 字节码、栈式 VM、闭包、集合、记录、异常、模块、中文标准库、中文数据库查询能力和模块化图书馆示例。
+华言（Huayan）是一门从语言运行时开始设计的中文独立脚本语言，目标是像 Python、Lua 一样通过命令行直接执行脚本。它不是 Python 的中文翻译层，也不是在 Python 上拼接语法，而是拥有自己的词法、语法、解析、名称解析、字节码和虚拟机。
+
+## 语言实现方式
+
+华言采用“源码编译为字节码，再由栈式虚拟机执行”的解释器架构：
+
+```text
+UTF-8 华言源码
+  → Lexer 词法分析
+  → Parser 语法分析与 AST
+  → Resolver 作用域和名称解析
+  → Compiler 编译为华言字节码
+  → Bytecode 验证
+  → VM 栈式虚拟机执行
+  → 中文标准库和受控原生资源
+```
+
+实现重点：
+
+- Lexer 直接处理中文关键字、中文标识符、全角标点和 Unicode NFC 规范化；
+- Parser 使用递归下降和 Pratt 表达式解析，形成独立的华言 AST；
+- Resolver 负责局部变量、闭包、上值和作用域检查；
+- Compiler 将函数、循环、异常、模块和表达式编译成自己的字节码；
+- VM 使用栈、局部槽位和 Upvalue 执行字节码，支持闭包、递归和资源生命周期；
+- 标准库通过原生模块注册表接入控制台、文件、时间、编码和 SQLite；
+- 数据库、事务和文件都使用不透明资源句柄，并经过能力权限检查；
+- CLI 负责脚本执行、REPL、语法检查、字节码反汇编、格式化和测试。
+
+因此，`.hua` 文件可以像 Python 的 `.py` 文件或 Lua 的 `.lua` 文件一样直接运行，同时语义、运行时和资源管理都由华言自己定义。
+
+完整语法参考见 [`docs/华言语法.md`](docs/华言语法.md)。
 
 ## 运行
 
@@ -8,18 +38,18 @@
 
 ```bash
 go run ./cmd/huayan --version
-go run ./cmd/huayan examples/你好世界.hua
-go run ./cmd/huayan check examples/斐波那契.hua
-go run ./cmd/huayan dis examples/斐波那契.hua
+go run ./cmd/huayan examples/图书馆/主.hua
+go run ./cmd/huayan check examples/图书馆/主.hua
+go run ./cmd/huayan dis examples/图书馆/主.hua
 go run ./cmd/huayan test tests
-go run ./cmd/huayan fmt --check examples/核心演示.hua
+go run ./cmd/huayan fmt --check tests/conformance/错误/异常捕获.hua
 ```
 
 也可以构建独立解释器：
 
 ```bash
 go build -o huayan ./cmd/huayan
-./huayan examples/你好世界.hua
+./huayan examples/图书馆/主.hua
 ```
 
 命令行入口：
@@ -102,13 +132,7 @@ go build -o huayan ./cmd/huayan
 
 ## 图书馆示例
 
-图书馆示例位于 `examples/图书馆/`，包含：
-
-- 图书、读者和借阅记录模型；
-- JSON 文件仓库；
-- 图书、读者、借阅业务服务；
-- 命令行菜单；
-- 模块化入口和测试示例。
+图书馆示例位于 `examples/图书馆/`，是一个单文件、可直接运行的完整应用，包含主函数、SQLite 数据库初始化、图书和读者管理、借阅归还、借阅记录查询及命令行菜单。数据库 API 和查询语法全部使用中文，运行时自动创建 `数据/图书馆.db`。
 
 运行图书馆程序：
 
@@ -133,7 +157,7 @@ scripts/test-library.sh ./huayan
 
 已实现核心语言、常用标准模块、能力权限上下文、资源管理、中文数据库 API 和查询语法糖；完整图书馆业务示例作为应用验证。尚未实现类、泛型、协程、包管理器、LSP、HTTP 服务和 JIT。
 
-数据库查询当前第一版使用字段等值条件；复杂条件构造器、项目清单、依赖安装、SQLite 图书馆迁移和 HTTP 服务属于第二阶段后续任务。
+数据库查询当前第一版使用字段等值条件；复杂条件构造器、项目清单、依赖安装和 HTTP 服务属于后续任务。
 
 ## 代码结构
 
@@ -151,8 +175,7 @@ internal/capability/能力权限集合
 internal/engine/  文件加载、模块解析和执行入口
 internal/formatter/源码格式化器
 tests/conformance/语言一致性测试
-examples/图书馆/  完整应用示例
-examples/数据库/  中文数据库连接和查询示例
+examples/图书馆/  完整图书管理应用示例
 docs/             教程、规范、ADR 和 API 文档
 ```
 
@@ -226,6 +249,7 @@ scripts/check-conformance.sh ./huayan
 
 进一步阅读：
 
+- `docs/华言语法.md`：变量、函数、控制流、模块、异常和中文数据库语法；
 - `docs/教程.md`：入门、语言导览和图书馆示例；
 - `docs/标准库API.md`：标准库接口；
 - `docs/spec/SQLite中文查询DSL设计.md`：中文数据库查询设计；
@@ -238,4 +262,4 @@ scripts/check-conformance.sh ./huayan
 
 ## 开发状态
 
-当前仓库处于第二阶段开发中。`v0.3.0` 是已提交的基线版本，当前主分支继续加入能力上下文、中文数据库和查询语法糖。字节码格式只作为内部实现，不承诺跨版本加载兼容。
+当前仓库处于第二阶段开发中，已完成中文数据库、查询语法糖、能力上下文、资源管理和图书馆应用示例。字节码格式只作为内部实现，不承诺跨版本加载兼容。
